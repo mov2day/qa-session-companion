@@ -7,8 +7,9 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger, DialogFooter, DialogDescription } from "@/components/ui/dialog";
-import { Plus, FlaskConical, Clock, CheckCircle2, AlertTriangle, ArrowRight } from "lucide-react";
+import { Plus, FlaskConical, Clock, CheckCircle2, AlertTriangle, ArrowRight, Loader2, Eye, EyeOff } from "lucide-react";
 import { apiRequest, queryClient } from "@/lib/queryClient";
 import type { Session } from "@/lib/types";
 
@@ -18,6 +19,8 @@ export default function Dashboard() {
   const [ticketId, setTicketId] = useState("");
   const [ticketTitle, setTicketTitle] = useState("");
   const [ticketDescription, setTicketDescription] = useState("");
+  const [visibility, setVisibility] = useState("team");
+  const [autoFetching, setAutoFetching] = useState(false);
 
   const { data: sessions, isLoading } = useQuery<Session[]>({
     queryKey: ["/api/sessions"],
@@ -29,15 +32,29 @@ export default function Dashboard() {
         ticketId: ticketId.trim(),
         ticketTitle: ticketTitle.trim() || null,
         ticketDescription: ticketDescription.trim() || null,
+        visibility,
       });
       return res.json();
     },
-    onSuccess: (session: Session) => {
+    onSuccess: async (session: Session) => {
+      // Auto-fetch context from integrations
+      setAutoFetching(true);
+      try {
+        await apiRequest("POST", "/api/context/fetch", {
+          sessionId: session.id,
+          ticketId: session.ticketId,
+        });
+      } catch {
+        // Non-blocking — context fetch failure doesn't block session creation
+      }
+      setAutoFetching(false);
+
       queryClient.invalidateQueries({ queryKey: ["/api/sessions"] });
       setOpen(false);
       setTicketId("");
       setTicketTitle("");
       setTicketDescription("");
+      setVisibility("team");
       navigate(`/session/${session.id}/plan`);
     },
   });
@@ -71,7 +88,7 @@ export default function Dashboard() {
             <DialogHeader>
               <DialogTitle>Start a New QA Session</DialogTitle>
               <DialogDescription>
-                Enter a ticket ID and optional context to generate a test plan.
+                Enter a ticket ID to auto-fetch context from Jira, GitHub, and Confluence.
               </DialogDescription>
             </DialogHeader>
             <div className="space-y-4 py-2">
@@ -83,9 +100,12 @@ export default function Dashboard() {
                   onChange={(e) => setTicketId(e.target.value)}
                   data-testid="input-ticket-id"
                 />
+                <p className="text-[11px] text-muted-foreground">
+                  Context will be auto-fetched from configured integrations (Jira, GitHub, Confluence).
+                </p>
               </div>
               <div className="space-y-2">
-                <label className="text-sm font-medium">Title (optional)</label>
+                <label className="text-sm font-medium">Title (optional — auto-filled from Jira)</label>
                 <Input
                   placeholder="e.g. Add password reset flow"
                   value={ticketTitle}
@@ -99,18 +119,45 @@ export default function Dashboard() {
                   placeholder="Paste the ticket description, acceptance criteria, or any relevant context..."
                   value={ticketDescription}
                   onChange={(e) => setTicketDescription(e.target.value)}
-                  rows={5}
+                  rows={4}
                   data-testid="input-ticket-description"
                 />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Visibility</label>
+                <Select value={visibility} onValueChange={setVisibility}>
+                  <SelectTrigger className="h-9" data-testid="select-visibility">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="team">
+                      <span className="flex items-center gap-1.5">
+                        <Eye className="w-3 h-3" /> Team (visible to all)
+                      </span>
+                    </SelectItem>
+                    <SelectItem value="private">
+                      <span className="flex items-center gap-1.5">
+                        <EyeOff className="w-3 h-3" /> Private (only you)
+                      </span>
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </div>
             <DialogFooter>
               <Button
                 onClick={() => createSession.mutate()}
-                disabled={!ticketId.trim() || createSession.isPending}
+                disabled={!ticketId.trim() || createSession.isPending || autoFetching}
                 data-testid="button-create-session"
               >
-                {createSession.isPending ? "Creating..." : "Create Session"}
+                {createSession.isPending || autoFetching ? (
+                  <span className="flex items-center gap-1.5">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {autoFetching ? "Fetching context..." : "Creating..."}
+                  </span>
+                ) : (
+                  "Create Session"
+                )}
               </Button>
             </DialogFooter>
           </DialogContent>
@@ -178,6 +225,9 @@ export default function Dashboard() {
                         <Badge variant={config.variant} className="text-[10px] h-5">
                           {config.label}
                         </Badge>
+                        {session.visibility === "private" && (
+                          <EyeOff className="w-3 h-3 text-muted-foreground" />
+                        )}
                       </div>
                       {session.ticketTitle && (
                         <p className="text-sm text-muted-foreground truncate mt-0.5">
