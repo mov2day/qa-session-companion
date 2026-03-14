@@ -1,7 +1,8 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import type { TestMap } from "@shared/schema";
+import { fetchJiraTicket, fetchGithubPr, fetchConfluenceContext } from "./integrations";
+import type { TestMap, MergedContext, DashboardStats } from "@shared/schema";
 
 export async function registerRoutes(
   httpServer: Server,
@@ -22,7 +23,7 @@ export async function registerRoutes(
   });
 
   app.post("/api/sessions", async (req, res) => {
-    const { ticketId, ticketTitle, ticketDescription } = req.body;
+    const { ticketId, ticketTitle, ticketDescription, visibility } = req.body;
     if (!ticketId) return res.status(400).json({ error: "ticketId is required" });
 
     const session = await storage.createSession({
@@ -34,6 +35,8 @@ export async function registerRoutes(
       status: "planning",
       createdAt: Math.floor(Date.now() / 1000),
       completedAt: null,
+      createdBy: "default",
+      visibility: visibility || "team",
     });
     res.json(session);
   });
@@ -44,6 +47,98 @@ export async function registerRoutes(
     res.json(updated);
   });
 
+  app.delete("/api/sessions/:id", async (req, res) => {
+    const deleted = await storage.deleteSession(req.params.id);
+    if (!deleted) return res.status(404).json({ error: "Session not found" });
+    res.json({ ok: true });
+  });
+
+  // ─── Integration Config ───
+
+  app.get("/api/config/integrations", async (_req, res) => {
+    const config = await storage.getIntegrationConfig();
+    // Mask sensitive tokens
+    const masked = {
+      jira: { ...config.jira, apiToken: config.jira.apiToken ? "••••••" : undefined },
+      github: { ...config.github, token: config.github.token ? "••••••" : undefined },
+      confluence: { ...config.confluence, apiToken: config.confluence.apiToken ? "••••••" : undefined },
+    };
+    res.json(masked);
+  });
+
+  app.put("/api/config/integrations", async (req, res) => {
+    const existing = await storage.getIntegrationConfig();
+    const incoming = req.body;
+
+    // Preserve existing tokens if masked values are sent back
+    const config = {
+      jira: {
+        ...incoming.jira,
+        apiToken: incoming.jira?.apiToken === "••••••"
+          ? existing.jira.apiToken
+          : incoming.jira?.apiToken,
+      },
+      github: {
+        ...incoming.github,
+        token: incoming.github?.token === "••••••"
+          ? existing.github.token
+          : incoming.github?.token,
+      },
+      confluence: {
+        ...incoming.confluence,
+        apiToken: incoming.confluence?.apiToken === "••••••"
+          ? existing.confluence.apiToken
+          : incoming.confluence?.apiToken,
+      },
+    };
+
+    const saved = await storage.saveIntegrationConfig(config);
+    res.json(saved);
+  });
+
+  // ─── Context Fetch (Jira + GitHub + Confluence) ───
+
+  app.post("/api/context/fetch", async (req, res) => {
+    const { sessionId, ticketId } = req.body;
+    if (!ticketId) return res.status(400).json({ error: "ticketId is required" });
+
+    const config = await storage.getIntegrationConfig();
+
+    try {
+      const [jira, github, confluence] = await Promise.allSettled([
+        fetchJiraTicket(ticketId, config.jira),
+        fetchGithubPr(ticketId, config.github),
+        fetchConfluenceContext(ticketId, config.confluence),
+      ]);
+
+      const context: MergedContext = {
+        jira: jira.status === "fulfilled" ? jira.value : null,
+        github: github.status === "fulfilled" ? github.value : null,
+        confluence: confluence.status === "fulfilled" ? confluence.value : null,
+        fetchedAt: Math.floor(Date.now() / 1000),
+      };
+
+      // Update session with context + auto-fill title/description from Jira
+      if (sessionId) {
+        const updateData: Record<string, any> = {
+          contextJson: JSON.stringify(context),
+        };
+        if (context.jira) {
+          updateData.ticketTitle = context.jira.summary;
+          updateData.ticketDescription = [
+            context.jira.description,
+            context.jira.acceptanceCriteria ? `\n\nAcceptance Criteria:\n${context.jira.acceptanceCriteria}` : "",
+          ].filter(Boolean).join("");
+        }
+        await storage.updateSession(sessionId, updateData);
+      }
+
+      res.json(context);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to fetch context" });
+    }
+  });
+
   // ─── AI: Generate test map ───
 
   app.post("/api/ai/test-map", async (req, res) => {
@@ -51,8 +146,18 @@ export async function registerRoutes(
     const session = await storage.getSession(sessionId);
     if (!session) return res.status(404).json({ error: "Session not found" });
 
-    // Generate a realistic test map based on the ticket context
-    const testMap = generateTestMap(session.ticketId, session.ticketTitle || "", session.ticketDescription || "");
+    // Parse merged context if available
+    let mergedContext: MergedContext | null = null;
+    if (session.contextJson) {
+      try { mergedContext = JSON.parse(session.contextJson); } catch {}
+    }
+
+    const testMap = generateTestMap(
+      session.ticketId,
+      session.ticketTitle || "",
+      session.ticketDescription || "",
+      mergedContext
+    );
 
     await storage.updateSession(sessionId, {
       testMap: JSON.stringify(testMap),
@@ -72,7 +177,6 @@ export async function registerRoutes(
     const testMap: TestMap | null = session.testMap ? JSON.parse(session.testMap) : null;
     const logs = await storage.getLogEntries(sessionId);
 
-    // Determine covered areas
     const coveredAreas = new Set(logs.filter(l => l.mappedArea).map(l => l.mappedArea));
     const allAreas = testMap ? [
       ...testMap.happy_paths,
@@ -164,20 +268,112 @@ export async function registerRoutes(
     res.json(summary);
   });
 
+  // ─── Manager Dashboard Stats ───
+
+  app.get("/api/dashboard/stats", async (_req, res) => {
+    const sessions = await storage.getAllSessions();
+    const summaries = await storage.getAllSummaries();
+    const summaryMap = new Map(summaries.map(s => [s.sessionId, s]));
+
+    const completed = sessions.filter(s => s.status === "complete");
+    const completedSummaries = completed
+      .map(s => summaryMap.get(s.id))
+      .filter(Boolean) as typeof summaries;
+
+    const avgCoverage = completedSummaries.length > 0
+      ? Math.round(completedSummaries.reduce((sum, s) => sum + s.coveragePct, 0) / completedSummaries.length)
+      : 0;
+
+    // Count total bugs across all sessions
+    let totalBugs = 0;
+    const bugsByCategory: Record<string, number> = {};
+    for (const session of sessions) {
+      const logs = await storage.getLogEntries(session.id);
+      const bugs = logs.filter(l => l.type === "bug");
+      totalBugs += bugs.length;
+      for (const bug of bugs) {
+        const cat = bug.severity || "unrated";
+        bugsByCategory[cat] = (bugsByCategory[cat] || 0) + 1;
+      }
+    }
+
+    // Coverage trend (group by date)
+    const trendMap = new Map<string, { coverage: number[]; count: number }>();
+    for (const s of completedSummaries) {
+      const date = new Date(s.generatedAt * 1000).toISOString().split("T")[0];
+      const existing = trendMap.get(date) || { coverage: [], count: 0 };
+      existing.coverage.push(s.coveragePct);
+      existing.count++;
+      trendMap.set(date, existing);
+    }
+
+    const coverageTrend = Array.from(trendMap.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, data]) => ({
+        date,
+        coverage: Math.round(data.coverage.reduce((a, b) => a + b, 0) / data.coverage.length),
+        sessions: data.count,
+      }));
+
+    // Recent sessions with summaries
+    const recentSessions = sessions.slice(0, 10).map(s => ({
+      ...s,
+      summary: summaryMap.get(s.id),
+    }));
+
+    const stats: DashboardStats = {
+      totalSessions: sessions.length,
+      completedSessions: completed.length,
+      avgCoverage,
+      totalBugs,
+      goCount: completedSummaries.filter(s => s.goNogo === "go").length,
+      noGoCount: completedSummaries.filter(s => s.goNogo === "no-go").length,
+      conditionalCount: completedSummaries.filter(s => s.goNogo === "conditional").length,
+      coverageTrend,
+      bugsByCategory: Object.entries(bugsByCategory).map(([category, count]) => ({ category, count })),
+      recentSessions,
+    };
+
+    res.json(stats);
+  });
+
   return httpServer;
 }
 
 // ─── AI Mock Helpers ───
 
-function generateTestMap(ticketId: string, title: string, description: string): TestMap {
-  const context = `${title} ${description}`.toLowerCase();
+function generateTestMap(
+  ticketId: string,
+  title: string,
+  description: string,
+  mergedContext: MergedContext | null
+): TestMap {
+  // Build enriched context from all sources
+  let context = `${title} ${description}`.toLowerCase();
 
-  // Generate context-aware test areas
-  const hasAuth = /auth|login|password|token|session|permission/i.test(context);
+  if (mergedContext?.jira) {
+    const jira = mergedContext.jira;
+    context += ` ${jira.summary} ${jira.description || ""} ${jira.acceptanceCriteria || ""}`.toLowerCase();
+    context += ` ${jira.labels.join(" ")} ${jira.components.join(" ")}`.toLowerCase();
+  }
+
+  if (mergedContext?.github) {
+    const gh = mergedContext.github;
+    context += ` ${gh.title} ${gh.body || ""}`.toLowerCase();
+    context += ` ${gh.filesChanged.map(f => f.filename).join(" ")}`.toLowerCase();
+  }
+
+  if (mergedContext?.confluence) {
+    context += ` ${mergedContext.confluence.pages.map(p => `${p.title} ${p.excerpt}`).join(" ")}`.toLowerCase();
+  }
+
+  const hasAuth = /auth|login|password|token|session|permission|oauth/i.test(context);
   const hasForm = /form|input|submit|validation|field/i.test(context);
   const hasApi = /api|endpoint|request|response|rest|graphql/i.test(context);
-  const hasPayment = /payment|checkout|cart|price|billing/i.test(context);
-  const hasSearch = /search|filter|sort|query/i.test(context);
+  const hasPayment = /payment|checkout|cart|price|billing|stripe/i.test(context);
+  const hasSearch = /search|filter|sort|query|elasticsearch/i.test(context);
+  const hasDb = /database|migration|schema|sql|query/i.test(context);
+  const hasPerf = /performance|latency|p95|p99|load|cache/i.test(context);
 
   const happy_paths = [
     { area: "Core functionality", scenario: `Verify ${title || ticketId} works as described in acceptance criteria`, risk: "high" as const },
@@ -197,6 +393,7 @@ function generateTestMap(ticketId: string, title: string, description: string): 
   ];
 
   if (hasSearch) edge_cases.push({ area: "Search edge cases", scenario: "Search with very long queries, special chars, and SQL-like inputs", risk: "medium" as const });
+  if (hasDb) edge_cases.push({ area: "Data migration edge cases", scenario: "Verify backward compatibility with existing data after schema changes", risk: "high" as const });
 
   const negative_flows = [
     { area: "Invalid input", scenario: "Submit with missing required fields and verify error messages", risk: "high" as const },
@@ -213,12 +410,29 @@ function generateTestMap(ticketId: string, title: string, description: string): 
   ];
 
   if (hasApi) integration_risks.push({ area: "API rate limiting", scenario: "Verify behavior when API rate limits are hit", risk: "low" as const });
+  if (hasPerf) integration_risks.push({ area: "Performance under load", scenario: "Verify response times meet SLA under concurrent requests", risk: "high" as const });
 
+  // Enrich gaps from Confluence historical patterns
   const explicit_gaps = [
     "Performance under load not testable in current environment",
     "Third-party service behavior during outages",
     "Cross-browser rendering differences need dedicated session",
   ];
+
+  if (mergedContext?.confluence?.historicalPatterns) {
+    for (const pattern of mergedContext.confluence.historicalPatterns) {
+      explicit_gaps.push(`Historical pattern: ${pattern}`);
+    }
+  }
+
+  // Enrich from PR review comments
+  if (mergedContext?.github?.reviewComments) {
+    for (const comment of mergedContext.github.reviewComments.slice(0, 3)) {
+      if (comment.body.toLowerCase().includes("test") || comment.body.toLowerCase().includes("edge case")) {
+        explicit_gaps.push(`PR review concern (${comment.path}): ${comment.body.slice(0, 150)}`);
+      }
+    }
+  }
 
   return { happy_paths, edge_cases, negative_flows, integration_risks, explicit_gaps };
 }
@@ -267,7 +481,6 @@ function generateNudge(
     return "Ready to wrap up. I'll generate your session summary now.";
   }
 
-  // Default: confirm logged and suggest next
   const pct = totalCount > 0 ? Math.round((coveredCount / totalCount) * 100) : 0;
   if (uncoveredHigh.length > 0) {
     return `Logged and mapped. Coverage at ${pct}%. Consider "${uncoveredHigh[0].area}" next — it's high-risk and untested.`;
@@ -293,7 +506,6 @@ function generateSummaryReport(
 
   let report = `# Session Summary: ${ticketId}\n\n`;
 
-  // Section 1: How I understood this ticket
   report += `## How I Read This Ticket\n\n`;
   report += `When I received **${ticketId}** ("${title}"), I analyzed the ticket context and identified `;
   report += `**${allAreas.length} test areas** across four categories: `;
@@ -302,13 +514,25 @@ function generateSummaryReport(
   const lowCount = allAreas.filter(a => a.risk === "low").length;
   report += `${highCount} high-risk, ${medCount} medium-risk, and ${lowCount} low-risk scenarios.\n\n`;
 
+  // Mention context sources used
+  let mergedContext: any = null;
+  try { mergedContext = session.contextJson ? JSON.parse(session.contextJson) : null; } catch {}
+  if (mergedContext) {
+    const sources: string[] = [];
+    if (mergedContext.jira) sources.push("Jira ticket details");
+    if (mergedContext.github) sources.push(`GitHub PR #${mergedContext.github.prNumber} (${mergedContext.github.filesChanged?.length || 0} files changed)`);
+    if (mergedContext.confluence) sources.push(`${mergedContext.confluence.pages?.length || 0} Confluence pages`);
+    if (sources.length > 0) {
+      report += `Context sources: ${sources.join(", ")}.\n\n`;
+    }
+  }
+
   if (testMap?.explicit_gaps && testMap.explicit_gaps.length > 0) {
     report += `I flagged ${testMap.explicit_gaps.length} explicit gaps where I couldn't determine testability from context alone:\n`;
     testMap.explicit_gaps.forEach(g => { report += `- ${g}\n`; });
     report += `\n`;
   }
 
-  // Section 2: What the session revealed
   report += `## What the Session Revealed\n\n`;
   report += `During the session, **${utterances.length} test actions** were logged covering **${coveredAreas.size} of ${allAreas.length}** planned areas (${coveragePct}% coverage).\n\n`;
 
@@ -331,7 +555,6 @@ function generateSummaryReport(
     report += `\n`;
   }
 
-  // Untested areas
   const untestedAreas = allAreas.filter(a => !coveredAreas.has(a.area));
   if (untestedAreas.length > 0) {
     report += `### Untested Areas (${untestedAreas.length})\n\n`;
@@ -341,7 +564,6 @@ function generateSummaryReport(
     report += `\n`;
   }
 
-  // Section 3: My honest assessment
   report += `## My Honest Assessment\n\n`;
   report += `| Metric | Value |\n|---|---|\n`;
   report += `| Coverage | ${coveragePct}% |\n`;

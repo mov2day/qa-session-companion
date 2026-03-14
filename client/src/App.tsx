@@ -10,6 +10,8 @@ import Dashboard from "@/pages/Dashboard";
 import Plan from "@/pages/Plan";
 import Test from "@/pages/Test";
 import Report from "@/pages/Report";
+import Settings from "@/pages/Settings";
+import ManagerDashboard from "@/pages/ManagerDashboard";
 import NotFound from "@/pages/not-found";
 
 function AppRouter() {
@@ -20,6 +22,8 @@ function AppRouter() {
         <Route path="/session/:id/plan" component={Plan} />
         <Route path="/session/:id/test" component={Test} />
         <Route path="/session/:id/report" component={Report} />
+        <Route path="/settings" component={Settings} />
+        <Route path="/manager" component={ManagerDashboard} />
         <Route component={NotFound} />
       </Switch>
     </Layout>
