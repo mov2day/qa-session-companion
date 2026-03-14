@@ -1,11 +1,13 @@
 import { Link, useLocation } from "wouter";
 import { useTheme } from "@/lib/theme";
-import { Sun, Moon, FlaskConical, ClipboardList, TestTubes, FileText, Home } from "lucide-react";
+import { Sun, Moon, FlaskConical, ClipboardList, TestTubes, FileText, Home, BarChart3, Settings2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { PerplexityAttribution } from "@/components/PerplexityAttribution";
 
 const NAV_ITEMS = [
-  { href: "/", label: "Dashboard", icon: Home },
+  { href: "/", label: "Sessions", icon: Home },
+  { href: "/manager", label: "Dashboard", icon: BarChart3 },
+  { href: "/settings", label: "Settings", icon: Settings2 },
 ];
 
 export function Layout({ children }: { children: React.ReactNode }) {
@@ -23,16 +25,18 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
                   <FlaskConical className="w-4 h-4 text-primary-foreground" />
                 </div>
-                <span className="font-semibold text-sm tracking-tight" data-testid="app-title">
+                <span className="font-semibold text-sm tracking-tight hidden sm:block" data-testid="app-title">
                   QA Companion
                 </span>
               </div>
             </Link>
 
-            <nav className="hidden sm:flex items-center gap-1 ml-6">
+            <nav className="flex items-center gap-1 ml-4">
               {NAV_ITEMS.map((item) => {
                 const Icon = item.icon;
-                const isActive = location === item.href;
+                const isActive = item.href === "/"
+                  ? location === item.href
+                  : location.startsWith(item.href);
                 return (
                   <Link key={item.href} href={item.href}>
                     <Button
@@ -42,7 +46,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                       data-testid={`nav-${item.label.toLowerCase()}`}
                     >
                       <Icon className="w-3.5 h-3.5" />
-                      {item.label}
+                      <span className="hidden sm:inline">{item.label}</span>
                     </Button>
                   </Link>
                 );
